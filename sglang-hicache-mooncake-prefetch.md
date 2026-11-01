@@ -13,7 +13,7 @@
 |---|---|---|
 | 1 | 调用 mooncake `batch_get_v1` 的是后台线程 **`prefetch_io_aux_thread`**，不是 scheduler 主线程 | 实跑抓栈 |
 | 2 | **MLA 下 `batch_is_exist` 与 `batch_get_into` 的 RPC 次数严格 1:1**，单次 exists 更便宜 → IO 本身不是瓶颈 | 实测 + 源码 |
-| 3 | **真正的瓶颈是排队**：`prefetch_thread` / `prefetch_io_aux_thread` 各只有 1 个线程、两级串行 → head-of-line blocking。实测 256 并发时排队等待涨到 **1.45 秒**，而 `_page_transfer` 自身恒定 **3.6~5.6 ms** | 实测 |
+| 3 | **真正的瓶颈是排队**：`prefetch_thread` / `prefetch_io_aux_thread` 各只有 1 个线程 → head-of-line blocking。**模型无关的硬事实：即使把 mooncake 延迟设为 0，256 个请求的 prefetch 仍需 824.7 ms 才全部完成（每 op 3.22 ms 纯 Python/结构开销）。** 在假设 RPC 延迟 2 ms 的模型下，排队等待涨到 **1.2~1.5 s**，而 `_page_transfer` 自身恒定 **3.2~5.6 ms**（绝对值随假设线性缩放，见 §3.4） | 结构=实测；绝对值=建模 |
 | 4 | **收割（harvest）被 `batch_is_full` 卡住**：唯一收割点 `scheduler.py:2086` 位于 staging loop 内，而该 loop 在 batch 满时会 `break`（:2081）或整个 early-return（:1993）→ **底层早完成了，radix tree 索引却迟迟建不上** | 源码 + 实测 |
 | 5 | **收割周期 ≈ 一次 forward 的墙钟 T**：overlap 调度器里 scheduler 线程阻塞在 `pop_and_process()` → `copy_done.synchronize()`（等上一批结果拷回 CPU），不是空轮询 | 源码 |
 | 6 | **在收割到来之前，数据物理上已在 host 内存里（零拷贝直写），但 radix tree 里没有索引 → 请求 `match_prefix` 命中不了 → L3 收益为 0，且 host 页与 `prefetch_tokens_occupied` 一直被占着** | 源码 |
@@ -114,7 +114,10 @@ prefetch_io_aux_thread ★ 只有 1 个线程
 done
 ```
 
-**两级都单线程串行 ⇒ 流水线吞吐上限 ≈ 1 / 单个 op 的串行时间。**
+**两个阶段各只有 1 个线程，且在不同线程里 → 它们对不同 op 是并行推进的（流水线）。**
+
+**⇒ 流水线吞吐 = 1 / max(单 op 的 exists 阶段耗时, 单 op 的 get 阶段耗时)。**
+**⇒ 阶段内部的 head-of-line blocking 是真实存在的：get 阶段一次只处理一个 op，且要拉完该 op 的所有批次才放行下一个 → 一个长 prompt 的 op 会阻塞后面所有 op 的传输。**
 
 ---
 
@@ -122,7 +125,8 @@ done
 
 ### 3.1 实测：排队等待 vs `_page_transfer` 自身耗时
 
-条件：MLA `page_size=64`，8192 tokens/req，mooncake `exists=2ms/call`、`get=2ms/call`（两者对等，无延迟假设）
+条件：MLA `page_size=64`，8192 tokens/req，mooncake `exists=2ms/call`、`get=2ms/call`
+**⚠️ 注意：2 ms 是本分析【假设】的 RPC 延迟，不是实测值。绝对值的解读范围见 §3.4。**
 
 | 并发 reqs | 全部完成耗时 | **排队等待 首→末** | **`_page_transfer` 自身 均值** |
 |---|---|---|---|
@@ -132,7 +136,19 @@ done
 | 64 | 328.8 ms | 7.0 → 324.3 ms | **4.96 ms** |
 | 256 | 1453.0 ms | 5.6 → **1448.3 ms** | **5.59 ms** |
 
-**⇒ `_page_transfer` 恒定 3.6~5.6 ms（"很快"），但排队等待随负载线性涨到 1.45 s（"很慢"）。**
+**⇒ `_page_transfer` 恒定 3.2~5.6 ms（"很快"），但排队等待随负载线性涨到秒级（"很慢"）。**
+
+**⇒ 盯着 `_page_transfer` 看永远看不到瓶颈；要看 `prefetch_queue.qsize()` / `prefetch_buffer.qsize()`。**
+
+**复现性**（同一脚本连跑 3 次，取 256 并发那一行）：
+
+| 轮次 | 全部完成 | 排队等待(末) | `_page_transfer` 均值 |
+|---|---|---|---|
+| 第 1 次 | 1453.0 ms | 1448.3 ms | 5.59 ms |
+| 第 2 次 | 1315.5 ms | 1311.6 ms | 5.08 ms |
+| 第 3 次 | 1087.0 ms | 1081.4 ms | 4.19 ms |
+
+**⇒ 同一台机器上就有 ±25% 的运行间波动。文档里的绝对值只能当量级看，不能当常数。**
 
 **⇒ 盯着 `_page_transfer` 看永远看不到瓶颈；要看 `prefetch_queue.qsize()` / `prefetch_buffer.qsize()`。**
 
@@ -155,6 +171,48 @@ done
 | **64**（MLA / FlashMLA） | 1 | 1 | **3.9 ms** |
 
 **⇒ 26 倍差距。通用 MHA 模型 page_size=1 会把 RPC 次数放大 64 倍。**
+
+### 3.4 哪些是硬事实，哪些是建模推导（重要）
+
+把假设的 RPC 延迟 `lat` 从 0 扫到 20 ms，固定 256 个请求：
+
+| 假设 exists=lat, get=lat | 全部完成 | 每 op 占用 | 排队等待(末) | `_page_transfer` |
+|---|---|---|---|---|
+| lat = 0.00 ms | 824.7 ms | 3.221 ms | 823.0 ms | 3.18 ms |
+| lat = 0.20 ms | 829.9 ms | 3.242 ms | 827.6 ms | 3.19 ms |
+| lat = 0.50 ms | 910.2 ms | 3.556 ms | 907.1 ms | 3.49 ms |
+| **lat = 2.00 ms** | **1211.0 ms** | **4.731 ms** | **1207.2 ms** | **4.65 ms** |
+| lat = 5.00 ms | 1808.2 ms | 7.063 ms | 1801.1 ms | 6.96 ms |
+| lat = 20.00 ms | 5559.5 ms | 21.717 ms | 5537.8 ms | 21.57 ms |
+
+**拟合关系：每 op 占用 ≈ lat + 2.7~3.2 ms（后者是纯 Python/结构开销）。**
+
+#### ✅ 模型无关的硬事实（与假设无关，可以直接拿去用）
+
+1. **RPC 调用次数**：`exists` 与 `get` 各 N 次（代码决定的精确值）
+2. **流水线每级只有 1 个线程** → 阶段内 head-of-line blocking 必然存在
+3. **每 op 约 3 ms 的纯 Python/结构开销**（`lat=0` 时测得）
+   - **⇒ 即使你的 mooncake RTT = 0，256 个请求的 prefetch 也要 824.7 ms 才全部完成。**
+   - 这部分开销来自：`_storage_hit_query` 的链式 SHA-256 + 列表构建、`batch_get_v1` 的 buffer meta 计算（128 次/批）
+4. **排队等待随 backlog 线性增长，而 `_page_transfer` 自身耗时不随 backlog 增长**（这个"形状"与假设无关）
+
+#### ⚠️ 模型推导的部分（不能直接当成你线上的预测）
+
+- **1.45 s / 3.2~5.6 ms 这些具体数值**，取决于我假设的 `lat=2ms`
+- 你的真实 mooncake RTT 是多少，决定了这个数字落在扫描表的哪一档：
+  `lat=0.5ms → 0.91 s`｜`lat=2ms → 1.21 s`｜`lat=5ms → 1.81 s`｜`lat=20ms → 5.56 s`
+
+#### 📌 另一个被实测否证的假设
+
+原以为「砍掉 exists 阶段 → 流水线吞吐翻倍」。**实测不成立**：
+
+| 场景（N=256） | 吞吐 |
+|---|---|
+| 有 exists 阶段 | 214.6 / 274.4 req/s（两次跑） |
+| 无 exists 阶段（`exists_latency=0`） | 215.3 / 188.6 req/s（两次跑） |
+
+**⇒ 因为 exists 阶段和 get 阶段在两个不同线程里并行推进，砍掉 exists 阶段并不会缩短流水线周期。**
+**⇒ 合并 exists+get 的真实收益是「mooncake master 的写压力减半」（少一轮续租写），而不是「本机吞吐翻倍」。**
 
 ---
 
@@ -507,11 +565,19 @@ self.prefetch_io_aux_threads = [
 - MLA：8192 token 一次 RPC → 32768 token 一次 RPC
 - ⚠️ 一次 RPC 的 key 数变多，master 端单次处理时间变长；需要实测找拐点
 
-### P3 — 合并 exists + get（收益有上限，且有语义风险）
+### P3 — 合并 exists + get（**不提升本机吞吐**，只减轻 master 压力，且有语义风险）
 
 mooncake 的 `batch_get_into` 对不存在的 key 返回**负数**（`mooncake_store.py:485` 注释：*each element is the number of bytes read on success, or a negative value on error*），所以可以一次拉完再判断命中。
 
-**但实测显示单纯省掉 exists RPC 收益有限**：把 exists 延迟设成 0，吞吐几乎没变（226 → 187 req/s），因为 `_storage_hit_query` 里的 Python 哈希 + 列表构建成本 ≈ RPC 成本。真要省必须**连哈希一起省**（挪到传输阶段复用，或缓存 page hash）。
+**⚠️ 实测否证了「合并能让流水线吞吐翻倍」这个假设**：exists 阶段和 get 阶段在**两个不同线程**里并行推进，流水线周期 = max(两阶段耗时)，砍掉 exists 阶段不会缩短周期。
+
+| 场景（N=256） | 吞吐（两次独立运行） |
+|---|---|
+| 有 exists 阶段 | 214.6 / 274.4 req/s |
+| 无 exists 阶段（`exists_latency=0`） | 215.3 / 188.6 req/s |
+
+**⇒ 真实收益是「mooncake master 的写压力减半」**（少一轮 per-key 续租写，见 §6.2），**不是本机吞吐提升**。
+**⇒ 要提升本机吞吐，得走 P1（加 worker）或 P2（减少批次），或减少 `_storage_hit_query` 里的 Python 哈希开销**（挪到传输阶段复用 / 缓存 page hash）——**但哈希是必须的，省不掉，只能挪位置**。
 
 **⚠️ 语义风险**：exists 会**续租**（写 metadata），get 不会。合并后**续租语义丢失**，对象可能在传输过程中被回收。**必须与 mooncake 上游确认后再改。**
 
@@ -568,21 +634,31 @@ logger.info("[hicache] harvest req=%s age=%.1fms done=%d/%d occupied=%d",
 
 ## 11. 附：探针脚本
 
-下列脚本是本地分析用的探针工具，**未包含在本仓库中**（路径为本机 Windows 环境）。跑法：
+下列脚本是本地分析用的探针工具。**全部 6 个脚本已随本仓库提交在 [`probes/`](./probes/)**，可独立复现本文档的每一个数据点。
+
+跑法（先 cd 到 sglang 仓库，让 `import sglang` 生效）：
 
 ```bash
-wsl -d Ubuntu-24.04 -- bash -lc "cd /home/mzygd/workspace/sglang && .venv/bin/python /mnt/d/Codes/<脚本名>"
+wsl -d Ubuntu-24.04 -- bash -lc "cd /home/mzygd/workspace/sglang && .venv/bin/python <仓库路径>/probes/<脚本名>"
 ```
 
-| 脚本 | 作用 |
-|---|---|
-| `mooncake_backtrace_repro.py` | 抓取调用 mooncake `batch_get_xx` 的线程真实 backtrace（faulthandler 格式） |
-| `prefetch_latency_probe.py` | MHA/page_size=1 的分阶段耗时拆解 |
-| `prefetch_mla_probe.py` | MLA 版：RPC 次数表 + 收割时机实验 + 并发场景 |
-| `prefetch_interrupt_probe.py` | 专门验证「收割时机决定收益」 |
-| `prefetch_queue_probe.py` | **流水线排队实测**（并发压力下 `_page_transfer` vs 排队等待） |
+| 脚本 | 作用 | 产出 |
+|---|---|---|
+| `verify_stub_fidelity.py` | **替身保真度自检**：把「替身是否忠实」变成可执行断言（逐指针比对真实 `get_page_buffer_meta`、断言真实方法实际发出的 RPC 次数、断言调用线程名、断言收割时机语义） | 整套结论的信任基础 |
+| `prefetch_queue_probe.py` | 流水线排队实测 + **延迟敏感性扫描** | §3.1 / §3.4 |
+| `mooncake_backtrace_repro.py` | 抓取调用 mooncake `batch_get_xx` 的线程真实 backtrace（faulthandler 格式） | §2.2 |
+| `prefetch_mla_probe.py` | MLA 版：RPC 次数表 + 收割时机实验 + 并发场景 | §3.3 / §5.2 |
+| `prefetch_interrupt_probe.py` | 专门验证「收割时机决定收益」 | §5.2 |
+| `prefetch_latency_probe.py` | MHA/page_size=1 的分阶段耗时拆解 | §3.2 |
 
-> 所有脚本都用真实 sglang 代码路径，只把 mooncake 的 C++ 对象 `MooncakeDistributedStore` 换成可控延迟的替身。**RPC 次数、Python 开销是代码决定的精确值；延迟配比是建模值。**
+> 所有脚本都用**真实 sglang 代码路径**，只把 mooncake 的 C++ 对象 `MooncakeDistributedStore` 换成可控延迟的替身。
+>
+> **必须区分的两类数字：**
+> - **RPC 调用次数、Python 开销、结构（单线程 / 阶段内 head-of-line blocking）** —— 代码决定的精确值，**模型无关**
+> - **所有带 ms 的绝对耗时** —— 取决于脚本里 `exists_latency` / `get_latency` 的**假设值**，用 `lat=0` 那档读出模型无关的下界
+>
+> §3.4 给出了完整的敏感性扫描表，便于把假设换成你线上的真实 RTT。
+> **测试方法论、替身边界、以及「这套方法不能证明什么」→ 见 [TESTING.md](./TESTING.md)。**
 
 ---
 
